@@ -1,165 +1,180 @@
 import pandas as pd
 import numpy as np
-import logging
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.cluster import KMeans
 from datetime import datetime
-from typing import List, Tuple
+import os
+import logging
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_data(filepath: str) -> pd.DataFrame:
-    """
-    Loads data from a specified CSV file path.
-
-    Args:
-        filepath (str): The path to the CSV file.
-
-    Returns:
-        pd.DataFrame: A pandas DataFrame containing the loaded data.
+class RFMTransformer(BaseEstimator, TransformerMixin):
+    """Calculates RFM and temporal features."""
+    def __init__(self, snapshot_date=None):
+        self.snapshot_date = pd.to_datetime(snapshot_date) if snapshot_date else datetime.now()
+        if hasattr(self.snapshot_date, 'tz') and self.snapshot_date.tz is not None:
+            self.snapshot_date = self.snapshot_date.tz_localize(None)
+        
+    def fit(self, X, y=None):
+        return self
     
-    Raises:
-        FileNotFoundError: If the file at the specified path does not exist.
-    """
-    try:
-        logging.info(f"Loading data from {filepath}...")
-        df = pd.read_csv(filepath)
-        logging.info("Data loaded successfully.")
-        return df
-    except FileNotFoundError:
-        logging.error(f"Error: The file was not found at {filepath}")
-        raise
+    def transform(self, X):
+        X_transformed = X.copy()
+        
+        X_transformed['TransactionStartTime'] = pd.to_datetime(X_transformed['TransactionStartTime'])
+        if hasattr(X_transformed['TransactionStartTime'].dtype, 'tz'):
+            X_transformed['TransactionStartTime'] = X_transformed['TransactionStartTime'].dt.tz_localize(None)
+        
+        rfm = X_transformed.groupby('CustomerId').agg(
+            Recency=('TransactionStartTime', lambda x: (self.snapshot_date - x.max()).days),
+            Frequency=('TransactionId', 'count'),
+            MonetarySum=('Value', 'sum'),
+            MonetaryMean=('Value', 'mean'),
+            MonetaryStd=('Value', 'std')
+        )
+        rfm['MonetaryStd'] = rfm['MonetaryStd'].fillna(0)
+        
+        X_transformed['TransactionHour'] = X_transformed['TransactionStartTime'].dt.hour
+        X_transformed['TransactionDay'] = X_transformed['TransactionStartTime'].dt.day
+        X_transformed['TransactionMonth'] = X_transformed['TransactionStartTime'].dt.month
+        
+        return pd.merge(X_transformed, rfm, on='CustomerId', how='left')
 
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Performs basic preprocessing on the transaction DataFrame.
-
-    - Converts 'TransactionStartTime' to datetime objects.
-    - Handles potential inconsistencies in 'Amount' and 'Value'.
-
-    Args:
-        df (pd.DataFrame): The raw transaction DataFrame.
-
-    Returns:
-        pd.DataFrame: The preprocessed DataFrame.
-    """
-    logging.info("Starting data preprocessing...")
-    # Work on a copy to avoid SettingWithCopyWarning
-    df_processed = df.copy()
-
-    # Convert to datetime
-    df_processed['TransactionStartTime'] = pd.to_datetime(df_processed['TransactionStartTime'])
-
-    # Ensure 'Value' is positive as it represents the transaction's magnitude
-    if 'Value' not in df_processed.columns:
-        logging.warning("'Value' column not found. Creating from 'Amount'.")
-        df_processed['Value'] = df_processed['Amount'].abs()
+class HighRiskLabelGenerator(BaseEstimator, TransformerMixin):
+    """Generates a binary 'is_high_risk' label using KMeans clustering."""
+    def __init__(self, n_clusters=3, random_state=42):
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.kmeans = None
+        self.scaler = StandardScaler()
+        self.high_risk_cluster_ = None
+        
+    def fit(self, X, y=None):
+        customer_rfm_for_clustering = X.groupby('CustomerId')[['Recency', 'Frequency', 'MonetarySum']].first().reset_index()
+        X_scaled = self.scaler.fit_transform(customer_rfm_for_clustering[['Recency', 'Frequency', 'MonetarySum']])
+        
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_state, n_init='auto')
+        self.kmeans.fit(X_scaled)
+        
+        cluster_centers_scaled = self.kmeans.cluster_centers_
+        cluster_centers_original_scale = self.scaler.inverse_transform(cluster_centers_scaled)
+        risk_order_df = pd.DataFrame(cluster_centers_original_scale, columns=['Recency', 'Frequency', 'MonetarySum'])
+        
+        self.high_risk_cluster_ = risk_order_df.sort_values(
+            ['Recency', 'Frequency', 'MonetarySum'],
+            ascending=[False, True, True]
+        ).index[0]
+        
+        return self
     
-    logging.info("Data preprocessing complete.")
-    return df_processed
+    def transform(self, X):
+        X_transformed = X.copy()
+        
+        customer_rfm_for_predict = X_transformed.groupby('CustomerId')[['Recency', 'Frequency', 'MonetarySum']].first().reset_index()
+        X_scaled = self.scaler.transform(customer_rfm_for_predict[['Recency', 'Frequency', 'MonetarySum']])
+        clusters_per_customer = self.kmeans.predict(X_scaled)
+        
+        customer_id_to_risk_label = dict(zip(
+            customer_rfm_for_predict['CustomerId'],
+            (clusters_per_customer == self.high_risk_cluster_).astype(int)
+        ))
+        
+        X_transformed['is_high_risk'] = X_transformed['CustomerId'].map(customer_id_to_risk_label)
+        
+        # Incorporate fraud data for high-risk labeling
+        fraud_summary = X_transformed.groupby('CustomerId')['FraudResult'].sum().reset_index()
+        fraud_summary.rename(columns={'FraudResult': 'TotalFraudTransactions'}, inplace=True)
+        X_transformed = pd.merge(X_transformed, fraud_summary, on='CustomerId', how='left')
+        X_transformed['TotalFraudTransactions'] = X_transformed['TotalFraudTransactions'].fillna(0)
+        X_transformed['is_high_risk'] = np.where(X_transformed['TotalFraudTransactions'] > 0, 1, X_transformed['is_high_risk'])
+        
+        return X_transformed
 
-def generate_rfms_features(df: pd.DataFrame, snapshot_date: datetime) -> pd.DataFrame:
-    """
-    Generates Recency, Frequency, Monetary, and Std Dev (Volatility) features.
-
-    Args:
-        df (pd.DataFrame): The preprocessed transaction DataFrame.
-        snapshot_date (datetime): The reference date for calculating recency.
-
-    Returns:
-        pd.DataFrame: A DataFrame with CustomerId and RFMS features.
-    """
-    logging.info("Generating RFMS features...")
+def build_feature_pipeline():
+    """Builds the complete feature engineering pipeline."""
+    numerical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
     
-    # Aggregate transaction data at the customer level
-    agg_df = df.groupby('CustomerId').agg(
-        Last_Transaction_Date=('TransactionStartTime', 'max'),
-        Frequency=('TransactionId', 'count'),
-        Monetary=('Value', 'sum'),
-        Std_Dev_Amount=('Value', 'std')
-    ).reset_index()
-
-    # Calculate Recency
-    agg_df['Recency'] = (snapshot_date - agg_df['Last_Transaction_Date']).dt.days
-
-    # Fill NaN in Std_Dev_Amount for customers with a single transaction
-    agg_df['Std_Dev_Amount'] = agg_df['Std_Dev_Amount'].fillna(0)
+    # Adjust categorical features based on Xente dataset (e.g., no ProductCategory)
+    categorical_features = []  # Add relevant categorical columns if present in your data
+    if 'ChannelId' in pd.read_csv('data/data.csv').columns:
+        categorical_features.append('ChannelId')
+    if 'PricingStrategy' in pd.read_csv('data/data.csv').columns:
+        categorical_features.append('PricingStrategy')
     
-    # Select and rename columns for clarity
-    rfms_df = agg_df[['CustomerId', 'Recency', 'Frequency', 'Monetary', 'Std_Dev_Amount']]
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
     
-    logging.info("RFMS feature generation complete.")
-    return rfms_df
-
-def create_risk_proxy(rfms_df: pd.DataFrame, fraud_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Creates a binary risk proxy variable based on RFM scores and fraud history.
+    numerical_features = ['Recency', 'Frequency', 'MonetarySum', 'MonetaryMean', 'MonetaryStd']
+    temporal_features = ['TransactionHour', 'TransactionDay', 'TransactionMonth']
+    target_as_feature_column = ['is_high_risk']
     
-    Proxy logic: A customer is 'high_risk' (1) if they have any fraudulent 
-    transactions OR if their combined RFM score is in the bottom quintile (20%). 
-    Otherwise, they are 'low_risk' (0).
-
-    Args:
-        rfms_df (pd.DataFrame): DataFrame with RFMS features.
-        fraud_df (pd.DataFrame): DataFrame with CustomerId and FraudResult.
-
-    Returns:
-        pd.DataFrame: The RFMS DataFrame with an added 'high_risk' proxy column.
-    """
-    logging.info("Creating risk proxy variable...")
-    
-    # 1. Handle Fraud Data
-    fraud_summary = fraud_df.groupby('CustomerId')['FraudResult'].sum().reset_index()
-    fraud_summary.rename(columns={'FraudResult': 'TotalFraudTransactions'}, inplace=True)
-    
-    # 2. Calculate RFM Scores
-    data = rfms_df.copy()
-    data['R_Score'] = pd.qcut(data['Recency'], 5, labels=False, duplicates='drop') + 1
-    data['F_Score'] = pd.qcut(data['Frequency'].rank(method='first'), 5, labels=False) + 1
-    data['M_Score'] = pd.qcut(data['Monetary'].rank(method='first'), 5, labels=False) + 1
-    
-    # Recency is inverted: lower is better
-    data['R_Score'] = 6 - data['R_Score']
-    
-    data['RFM_Score'] = data['R_Score'] + data['F_Score'] + data['M_Score']
-    
-    # 3. Merge fraud data with RFM data
-    data = pd.merge(data, fraud_summary, on='CustomerId', how='left')
-    data['TotalFraudTransactions'].fillna(0, inplace=True)
-
-    # 4. Define the proxy
-    # Define risk based on RFM score quantile
-    rfm_risk_threshold = data['RFM_Score'].quantile(0.20)
-    
-    # A customer is high risk if they have any fraud history OR a very low RFM score
-    data['high_risk'] = np.where(
-        (data['TotalFraudTransactions'] > 0) | (data['RFM_Score'] <= rfm_risk_threshold), 
-        1, 
-        0
+    final_preprocessor = ColumnTransformer(
+        [
+            ('num', numerical_pipeline, numerical_features),
+            ('cat', categorical_pipeline, categorical_features),
+            ('temp', 'passthrough', temporal_features),
+            ('target', 'passthrough', target_as_feature_column)
+        ],
+        remainder='drop'
     )
     
-    logging.info(f"Risk proxy created. High-risk proportion: {data['high_risk'].mean():.2%}")
-    return data
+    return Pipeline([
+        ('rfm_features', RFMTransformer()),
+        ('risk_labels', HighRiskLabelGenerator(n_clusters=3, random_state=42)),
+        ('final_preprocessing', final_preprocessor)
+    ])
 
-
-def get_feature_correlations(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-    """
-    Calculates the correlation of all numerical features with the target variable.
-
-    Args:
-        df (pd.DataFrame): The DataFrame containing features and the target.
-        target_col (str): The name of the target variable column.
-
-    Returns:
-        pd.DataFrame: A DataFrame showing features and their correlation with the target.
-    """
-    logging.info(f"Calculating feature correlations with target '{target_col}'...")
-    
-    if target_col not in df.columns:
-        logging.error(f"Target column '{target_col}' not found in DataFrame.")
-        raise ValueError(f"Target column '{target_col}' not found in DataFrame.")
+def main():
+    """Main execution function to process raw data and save model-ready data."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         
-    corr_matrix = df.corr()
-    corr_target = corr_matrix[[target_col]].sort_values(by=target_col, ascending=False)
-    
-    logging.info("Correlation calculation complete.")
-    return corr_target.drop(target_col) # Drop the target's self-correlation
+        processed_dir = os.path.normpath(os.path.join(script_dir, '../data/processed'))
+        os.makedirs(processed_dir, exist_ok=True)
+        
+        input_path = os.path.normpath(os.path.join(script_dir, '../data/data.csv'))
+        output_path = os.path.normpath(os.path.join(processed_dir, 'model_ready_data.csv'))
+        
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found at {input_path}")
+        data = pd.read_csv(input_path)
+        
+        logging.info(f"Loaded raw data with {data.shape[0]} rows and {data.shape[1]} columns.")
+        
+        pipeline = build_feature_pipeline()
+        processed_data_array = pipeline.fit_transform(data)
+        
+        all_feature_names = pipeline.named_steps['final_preprocessing'].get_feature_names_out()
+        processed_df = pd.DataFrame(processed_data_array, columns=all_feature_names)
+        processed_df.to_csv(output_path, index=False)
+        
+        logging.info(f"Data successfully processed and saved to: {output_path}")
+        logging.info(f"Shape of processed data: {processed_df.shape}")
+        logging.info(f"Columns in output: {processed_df.columns.tolist()}")
+        
+        actual_high_risk_col_name = 'target__is_high_risk'
+        if actual_high_risk_col_name in processed_df.columns:
+            logging.info(f"Target distribution ({actual_high_risk_col_name}):")
+            logging.info(processed_df[actual_high_risk_col_name].value_counts().to_string())
+        else:
+            logging.warning(f"'{actual_high_risk_col_name}' column not found. Check pipeline config.")
+            
+    except FileNotFoundError as fnf_error:
+        logging.error(f"File Error: {fnf_error}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    os.environ['LOKY_MAX_CPU_COUNT'] = '1'  # Disable parallel processing warnings
+    main()
